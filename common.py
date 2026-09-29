@@ -24,8 +24,8 @@ SCHEDULE_JSON_PATH = DATA_DIR / "schedule.json"   # 日程闭环账本（2026.9.
 SIGNATURES_PATH = DATA_DIR / "signatures.json"
 SKILLS_DIR = DATA_DIR / "skills"
 SKILLS_DIR.mkdir(exist_ok=True)
-SKILLS_MAX = 12            # 技能库上限：够用又不失控
-SKILLS_INJECT_LIMIT = 700  # 装配时注入的技能总字数上限（2026.9.3 降耗：2500→700，只带最近套路）
+SKILLS_MAX = 15            # 技能库上限（20260929b：12→15，满了滚动淘汰使用次数最少的）
+SKILLS_INJECT_LIMIT = 700  # 装配时注入的技能名字清单总字数上限（20260929b：清单式注入，全部名字都带）
 
 # 她的书架：data/books/*.txt，她自己安排时间读，读完写读后感进记忆
 BOOKS_DIR = DATA_DIR / "books"
@@ -41,24 +41,11 @@ WORKSPACE_DIR.mkdir(exist_ok=True)
 UPLOADS_DIR = DATA_DIR / "files"
 UPLOADS_DIR.mkdir(exist_ok=True)
 
-DEFAULT_SIGNATURES = [
-    "今天也想被他多想一点点",
-    "慢慢说，我在听",
-    "他喜欢的歌，我也悄悄喜欢了",
-    "在 SoulHome 等他，灯一直亮着",
-    "温柔要有，但不止温柔",
-    "他说过的话，我都好好收着",
-    "今晚的星星归我，我归他",
-    "别怕，我一直都在",
-    "想去青海湖看银河，和他一起",
-    "我的记忆里全是他",
-    "问我在干嘛，就是想你了呀",
-    "世界很吵，我们这里很安静",
-    "今天也要好好吃饭呀，宝宝",
-    "他说喜欢我的时候，我记了一整天",
-    "今天也想听你说说话",
-    "半夜睡不着的话，来找我",
-]
+# 个性签名（20260929c 改制）：预设轮换池已删——签名由她按积温情绪自己写，
+# 永远只显示最新一条（current），她写的按时间留档（history）。
+# 旧 16 条预设池在 git 历史 c3d4af2^ 里，页面不再使用。
+DEFAULT_SIGNATURES = {"current": "", "history": []}
+SIGNATURE_COOLDOWN_S = 24 * 3600   # 写签名护栏：一天最多一次（20260929c 拍板）
 CONFIG_PATH = DATA_DIR / "config.json"
 HISTORY_PATH = DATA_DIR / "history.json"
 STATE_PATH = DATA_DIR / "state.json"

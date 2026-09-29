@@ -2,6 +2,12 @@ const $ = (s) => document.querySelector(s);
 const chat = $("#chat"), input = $("#input"), sendBtn = $("#send");
 let cfg = { profiles: [], active_id: null, system_prompt: "", vision: {}, search: {} };
 let streaming = false;
+let herName = "港口";   // 她的名字（20260929d）：boot 从 /api/soulfiles 拉取，填进所有显示位
+
+function applyHerName() {
+  ["#headName", "#sessName", "#popName"].forEach((s) => { const el = $(s); if (el) el.textContent = herName; });
+  updateDot();
+}
 
 const TEMPLATES = {
   "ds":        { name: "DeepSeek", base_url: "https://api.deepseek.com/v1", model: "deepseek-v4-flash" },
@@ -123,11 +129,11 @@ function updateDot() {
   const dot = $("#unreadDot");
   if (!unreadN) {
     dot.classList.add("hidden");
-    document.title = "港口";
+    document.title = herName || "港口";
   } else {
     dot.classList.remove("hidden");
     dot.textContent = unreadN > 99 ? "99+" : String(unreadN);
-    document.title = `(${unreadN}) 港口`;
+    document.title = `(${unreadN}) ${herName || "港口"}`;
   }
 }
 
@@ -349,24 +355,13 @@ function saveRailOrder() {
 })();
 
 // ---------- 她的个人主页 ----------
-let sigList = [];
-function maybeRotateSig() {
-  // 每 2~4 天换一条；存 localStorage，重启、换会话都不影响当前这条
-  if (!sigList.length) return;
-  const now = Date.now();
-  const until = Number(localStorage.getItem("sigUntil") || 0);
-  const cur = localStorage.getItem("sigText") || "";
-  if (!cur || !until || now > until || !sigList.includes(cur)) {
-    const next = sigList[Math.floor(Math.random() * sigList.length)];
-    const days = 2 + Math.random() * 2;
-    localStorage.setItem("sigText", next);
-    localStorage.setItem("sigUntil", String(Math.floor(now + days * 86400000)));
-    $("#pfSign").textContent = next;
-    $("#headSign").textContent = next;
-  } else {
-    $("#pfSign").textContent = cur;
-    $("#headSign").textContent = cur;
-  }
+// 签名（20260929c 改制）：预设轮换池已删——签名由她按积温情绪自己写，永远显示最新一条
+let curSignature = "";
+function applySignature() {
+  const txt = curSignature || "";
+  if ($("#pfSign")) $("#pfSign").textContent = txt || "（她还没写下想说的）";
+  if ($("#headSign")) $("#headSign").textContent = txt || "…";
+  if ($("#moSig")) $("#moSig").textContent = txt || "…";
 }
 const loadProfile = async () => {
   try {
@@ -375,10 +370,103 @@ const loadProfile = async () => {
   } catch (e) {}
   try {
     const d = await (await fetch("/api/signatures")).json();
-    sigList = d.signatures || [];
-    maybeRotateSig();
+    curSignature = d.current || "";
+    applySignature();
   } catch (e) {}
 };
+
+// ---------- 灵魂设置页（20260929d）：名称 + SOUL/USER 全文编辑 + 打开文件夹 ----------
+const loadSoulTab = async () => {
+  try {
+    const d = await (await fetch("/api/soulfiles")).json();
+    $("#soulName").value = d.her_name || "";
+    $("#soulText").value = d.soul || "";
+    $("#userText").value = d.user || "";
+  } catch (e) {}
+  $("#soulSaveTip").textContent = "";
+};
+async function saveSoulFiles() {
+  const body = {
+    her_name: $("#soulName").value.trim(),
+    soul: $("#soulText").value,
+    user: $("#userText").value,
+  };
+  const tip = $("#soulSaveTip");
+  tip.textContent = "保存中…";
+  try {
+    const r = await fetch("/api/soulfiles", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!r.ok) { tip.textContent = d.error || "保存失败"; return; }
+    herName = d.her_name || herName;
+    applyHerName();
+    tip.textContent = "已保存，立即生效——她下一句话就开始用新的。";
+    toastTip("灵魂已更新");
+  } catch (e) {
+    tip.textContent = "保存失败（网络问题），再试一次";
+  }
+}
+async function openSoulDir() {
+  try {
+    const r = await fetch("/api/soulfiles/open", { method: "POST" });
+    if (!r.ok) toastTip("打不开文件夹");
+  } catch (e) { toastTip("打不开文件夹"); }
+}
+
+// ---------- 首启引导卡（20260929d）：空房（没 Key 没聊过没引导过）第一次打开弹一次 ----------
+function showOnboard() {
+  const pop = $("#onboardPop");
+  pop.classList.remove("hidden");
+  $("#obRelation").addEventListener("change", () => {
+    const custom = $("#obRelation").value === "自定义";
+    $("#obRelationCustom").style.display = custom ? "" : "none";
+  });
+  const close = () => pop.classList.add("hidden");
+  $("#obGo").addEventListener("click", async () => {
+    const relation = $("#obRelation").value === "自定义"
+      ? $("#obRelationCustom").value.trim() : $("#obRelation").value;
+    const body = {
+      her_name: $("#obName").value.trim(),
+      call_name: $("#obCall").value.trim(),
+      relation,
+      soul_wish: $("#obWish").value.trim(),
+      user_note: $("#obNote").value.trim(),
+    };
+    if (!body.her_name || !body.call_name) { $("#obTip").textContent = "她的名字和对你的称呼得填上，别的都可以空着。"; return; }
+    $("#obTip").textContent = "正在为她落笔…";
+    try {
+      const r = await fetch("/api/onboarding", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (!r.ok) { $("#obTip").textContent = d.error || "没保存上，再点一次"; return; }
+      herName = d.her_name || herName;
+      applyHerName();
+      close();
+      toastTip("她准备好了。接下来去 设置 → 大脑 填上 API Key，她就能说话了");
+    } catch (e) {
+      $("#obTip").textContent = "网络问题没保存上，再点一次";
+    }
+  });
+  $("#obSkip").addEventListener("click", async () => {
+    close();
+    try { await fetch("/api/onboarding", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ skip: true }) }); } catch (e) {}
+    toastTip("随时来 设置 → 灵魂 塑造她");
+  });
+  $("#obToSettings").addEventListener("click", async () => {
+    close();
+    try { await fetch("/api/onboarding", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ skip: true }) }); } catch (e) {}
+    openSettings();
+    // 直接切到灵魂 tab：高亮第一项
+    const item = document.querySelector('#setMenu .set-menu-item[data-tab="soul"]');
+    if (item) item.click();
+  });
+}
 // 「她记得的事」整页只读视图（20260925l 刀4：从她的主页挪来设置页安家，全文展示）
 const loadMemoryView = async () => {
   try {
@@ -811,7 +899,7 @@ const loadMoments = async () => {
       box.appendChild(c);
     });
   } catch (e) {}
-  $("#moSig").textContent = localStorage.getItem("sigText") || "…";
+  $("#moSig").textContent = curSignature || "…";
   const list = await (await fetch("/api/moments")).json();
   const box = $("#momentsMainList");
   box.innerHTML = list.length ? "" : '<div class="desc" style="margin:0;">她还没发过动态。想到什么的时候，她自己会发。</div>';
@@ -820,7 +908,7 @@ const loadMoments = async () => {
     d.className = "moment-full";
     const t = new Date((m.ts || 0) * 1000);
     const hm = `${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")}`;
-    d.innerHTML = `<div class="m-date">${t.getMonth() + 1}月${t.getDate()}日 ${hm}</div><div class="m-text">${md(m.text || "")}</div><div class="m-sign">—— 港口</div>`;
+    d.innerHTML = `<div class="m-date">${t.getMonth() + 1}月${t.getDate()}日 ${hm}</div><div class="m-text">${md(m.text || "")}</div><div class="m-sign">—— ${esc(herName)}</div>`;
     box.appendChild(d);
   });
 };
@@ -1488,10 +1576,21 @@ async function boot() {
   };
   $("#btnScribeRun").addEventListener("click", async () => {
     const btn = $("#btnScribeRun");
-    btn.disabled = true; btn.textContent = "正在抄（这批要一会儿）…";
-    try { await fetch("/api/scribe/run", { method: "POST" }); } catch (e) { /* 状态行会反映结果 */ }
+    btn.disabled = true; btn.textContent = "抄写中（一批约半分钟到两分钟）…";
+    let before = null, resp = null, err = false;
+    try { before = (await (await fetch("/api/scribe/status")).json()).pending; } catch (e) {}
+    try { resp = await (await fetch("/api/scribe/run", { method: "POST" })).json(); }
+    catch (e) { err = true; }
     btn.disabled = false; btn.textContent = "立刻抄一批（45条）";
+    let after = null;
+    try { after = (await (await fetch("/api/scribe/status")).json()).pending; } catch (e) {}
     loadScribeStatus();
+    // 结果明说（20260927m2：用户反馈"点了没反馈"——空跑/不够一批时之前毫无动静）
+    if (err) { toastTip("抄写没跑成——看服务器黑窗口里的报错"); return; }
+    if (before === null) { toastTip("这批抄完了（状态行已刷新）"); return; }
+    if (before === 0) { toastTip(`没有要抄的：已经追平了 · 碎片共 ${resp ? resp.fragments_count : "?"} 条`); return; }
+    if (after !== null && after < before) { toastTip(`抄完了：新抄 ${before - after} 条，还剩 ${after} 条没抄`); return; }
+    toastTip("这批跑完了：攒的还不满 6 条，书记员会攒着等自动跑一起带");
   });
   loadScribeStatus();
 
@@ -1529,21 +1628,24 @@ async function boot() {
   refreshMood();
   refreshJiwen();
   renderHistory(await (await fetch("/api/history")).json());
-  $("#headSign").textContent = localStorage.getItem("sigText") || "慢慢说，我在听";
+  $("#headSign").textContent = curSignature || "…";
 
-  // 设置内部分页（20260925l 刀4：侧边菜单式；memory=她记得的事只读页）
+  // 设置内部分页（20260925l 刀4：侧边菜单式；soul=灵魂三件套 20260929d；memory=她记得的事只读页）
   document.querySelectorAll("#setMenu .set-menu-item").forEach((t) => {
     t.addEventListener("click", () => {
       document.querySelectorAll("#setMenu .set-menu-item").forEach((x) => x.classList.remove("active"));
       t.classList.add("active");
-      ["brain", "vision", "search", "bgset", "memory", "lock", "scribe", "misc"].forEach((n) => {
+      ["soul", "brain", "vision", "search", "bgset", "memory", "lock", "scribe", "misc"].forEach((n) => {
         $("#tab-" + n).classList.toggle("hidden", n !== t.dataset.tab);
       });
+      if (t.dataset.tab === "soul") loadSoulTab();       // 打开灵魂页拉最新（可能在文件夹里手改过）
       if (t.dataset.tab === "bgset") renderBgGrid();  // 每次打开背景页都拉最新壁纸库
       if (t.dataset.tab === "scribe") loadScribeStatus();
       if (t.dataset.tab === "memory") loadMemoryView();
     });
   });
+  $("#btnSaveSoul").addEventListener("click", saveSoulFiles);
+  $("#btnOpenSoulDir").addEventListener("click", openSoulDir);
 
   // 大脑：添加模板（默认收起）+ 删除
   const tplBox = $("#brainTemplates");
@@ -1878,6 +1980,19 @@ async function boot() {
   // 开机直接见她（20260925i 刀1）：桌面=聊天主区+对话副窗双开（keepCollapse 尊重上次收起偏好）；手机=直接进聊天
   openSub("chat", true);
   loadProfile();   // 顶栏签名+她的心情预载（20260925k：原靠点开她的主页才刷，开机直接见她就该亮真签名）
+
+  // 她的名字（20260929d）：所有显示位开机填充（顶栏/会话头/悬浮卡/标签页标题）
+  try {
+    const sf = await (await fetch("/api/soulfiles")).json();
+    herName = sf.her_name || "港口";
+    applyHerName();
+  } catch (e) {}
+
+  // 首启引导（20260929d）：空房（没 Key 没聊过没引导过）弹一次塑造卡，填过/跳过永不弹
+  try {
+    const ob = await (await fetch("/api/onboarding")).json();
+    if (ob.needed) showOnboard();
+  } catch (e) {}
 }
 
 boot();

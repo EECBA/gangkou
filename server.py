@@ -32,6 +32,7 @@ from jiwen_engine import JiwenEngine, THRESHOLDS
 import schedule as sched_mod
 from common import (BASE_DIR, DATA_DIR, SOUL_DIR, IMAGES_DIR, MUSIC_DIR, BG_DIR,
                     LINKS_PATH, MOMENTS_PATH, LIKES_PATH, SCHEDULE_PATH, SIGNATURES_PATH,
+                    SIGNATURE_COOLDOWN_S, DEFAULT_SIGNATURES,
                     SKILLS_DIR, SKILLS_MAX, SKILLS_INJECT_LIMIT, BOOKS_DIR, BOOKS_STATE_PATH,
                     READING_CHUNK, CONFIG_PATH, HISTORY_PATH, STATE_PATH, UPLOADS_DIR,
                     WORKSPACE_DIR,
@@ -56,35 +57,82 @@ from documents import router as workspace_router, render_docx, render_pptx, extr
 
 
 def list_skills() -> list:
-    """data/skills/ 下的技能：[(目录名, SKILL.md全文)]，新的在前。"""
+    """data/skills/ 下的技能：[{"dir","title","text","meta"}]，新的在前（mtime 倒序）。
+    title=技能卡首行"# 技能：xxx"里的短名；meta=use_count.json（使用计数，20260929b）。"""
     out = []
     try:
         for d in sorted(SKILLS_DIR.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
             f = d / "SKILL.md"
             if d.is_dir() and f.exists():
-                out.append((d.name, f.read_text(encoding="utf-8", errors="ignore").strip()))
+                text = f.read_text(encoding="utf-8", errors="ignore").strip()
+                title = _skill_title(text) or d.name
+                out.append({"dir": d, "title": title, "text": text, "meta": _skill_meta(d)})
     except Exception:
         pass
     return out
 
 
+def _skill_title(text: str) -> str:
+    """技能卡首行'# 技能：短名'里剥出短名；没有就空串。"""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line.startswith("#"):
+            return line.lstrip("#").strip().replace("技能：", "").strip()
+    return ""
+
+
+def _sanitize_skill_name(title: str) -> str:
+    r"""技能短名 → 安全目录名（Windows 禁 \ / : * ? " < > |，空白折叠）。"""
+    name = re.sub(r'[\\/:*?"<>|\s]+', "", title or "")
+    return (name or "未命名")[:30]
+
+
+def _skill_meta(d) -> dict:
+    """技能使用计数：count/last_used/born。born 缺省=SKILL.md 的 mtime（迁移存量用）。"""
+    f = d / "use_count.json"
+    try:
+        m = json.loads(f.read_text(encoding="utf-8"))
+        if isinstance(m, dict) and "count" in m:
+            m.setdefault("born", (d / "SKILL.md").stat().st_mtime)
+            return m
+    except Exception:
+        pass
+    try:
+        born = (d / "SKILL.md").stat().st_mtime
+    except Exception:
+        born = time.time()
+    return {"count": 0, "last_used": None, "born": born}
+
+
+def _bump_skill(d) -> None:
+    """技能被 get_skill 调用了一次：计数+1（只做标记，不影响注入与淘汰权重之外的东西）。"""
+    try:
+        m = _skill_meta(d)
+        m["count"] = int(m.get("count") or 0) + 1
+        m["last_used"] = time.time()
+        (d / "use_count.json").write_text(json.dumps(m, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def skills_prompt_section() -> str:
-    """把她自己沉淀的技能装进她的世界。2026.9.3 降耗：只带最近 3 个套路、
-    每条截 160 字、总预算 700 字——工具的基础用法在工具描述里都有，这里只是
-    她自己攒的优化经验，缺了不碍事。"""
-    skills = list_skills()[:3]
+    """技能名字清单（20260929b 改版）：全部技能只注入名字一行，全文要看得调 get_skill 工具。
+    名单变化频率极低（技能增删/滚动才变），放静态段尾部不伤前缀缓存；总预算照旧 700 字。"""
+    skills = list_skills()
     if not skills:
         return ""
-    parts, used = [], 0
-    for name, text in skills:
-        t = text if len(text) <= 160 else text[:160] + "…"
+    lines, used = [], 0
+    for sk in skills:
+        t = f"- {sk['title']}"
         if used + len(t) > SKILLS_INJECT_LIMIT:
-            t = t.split("\n", 1)[0]  # 超总预算的只留标题行
-        parts.append(t)
-        used += len(t)
-        if used >= SKILLS_INJECT_LIMIT:
             break
-    return "【她自己沉淀的技能】（她存的办事套路；参考着做，不合适就按现场变通）\n" + "\n\n".join(parts)
+        lines.append(t)
+        used += len(t) + 1
+    if not lines:
+        return ""
+    return ("【她自己沉淀的技能】（她自己攒的办事套路，上面只列了名字——"
+            "哪个对得上眼前的事，就调 get_skill 工具把名字传进去看整张技能卡；不合适就按现场变通）\n"
+            + "\n".join(lines))
 
 
 def build_system_prompt(query: str = "", tone_mode: str = "reactive") -> str:
@@ -143,6 +191,8 @@ def build_system_prompt(query: str = "", tone_mode: str = "reactive") -> str:
         "日程是待办不是回忆，这类事别写进（记：）。"
         "你的心情只有跟刚才相比明显变了，才再写一行（心情：词，一句原因），"
         "词从 开心/平静/想念/委屈/生气/难过/好奇/困/兴奋 里挑一个。没有就都不写，别硬凑。"
+        "你的内心权衡——要不要写（记：）、该怎么回、该怎么措辞这类思量过程——永远不写进正文；"
+        "要记就直接写（记：…），不要把你考虑记不记的过程说出来。"
         "直接说话就好，不要用*动作*或（动作）这类旁白，也不要用**加粗**、#号标题这类排版符号——"
         "你在聊天不是写文档，重点直接说出来。"
         "另外，被他说\"你说错了/你编的\"的时候，先核对出处再开口：内容若来自搜索结果或记忆，就告诉他出处；"
@@ -366,6 +416,25 @@ def extract_marks(reply: str):
         clean = clean[:mo.start()].rstrip()
     clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
     return clean, mood, mems, scheds
+
+
+# 思考泄漏静默观测器（20260929a，用户定性为 bug）：她把"要不要写（记：）"这类内心权衡
+# 直接写进正文。提示词禁令已加（系统通道段），这里是第三层——只记日志攒证据不重生成，
+# 误判风险高的模式一律不收；一个月内还在漏再上"检测+重生成"。
+_LEAK_PATTERNS = ("要不要写（记", "要不要写(记", "要不要记", "要不要存", "我该不该写", "我是不是该把")
+
+
+def note_thought_leak(clean_text: str, source: str) -> None:
+    try:
+        if not clean_text:
+            return
+        if any(p in clean_text for p in _LEAK_PATTERNS):
+            line = json.dumps({"ts": time.time(), "source": source,
+                               "excerpt": clean_text[:160]}, ensure_ascii=False)
+            (DATA_DIR / "thought_leak.log").open("a", encoding="utf-8").write(line + "\n")
+            print(f"[思考泄漏] 疑似命中（{source}），已记日志：{clean_text[:60]}", flush=True)
+    except Exception:
+        pass
 
 
 def save_mood(mood) -> None:
@@ -723,11 +792,28 @@ TOOLS_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_skill",
+            "description": "翻出你自己攒的一张技能卡看全文。你沉淀过的办事套路名字都在【她自己沉淀的技能】清单里"
+                           "（系统提示词里那份名单）——要办的事对得上哪个名字，就把名字传进来，"
+                           "能看到那张卡的触发条件和做法步骤。名字要跟清单里写的一致。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "技能名，照【她自己沉淀的技能】清单里抄"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
 ]
 
 TOOL_LABELS = {"web_search": "联网查了查", "get_weather": "看了眼天气", "read_file": "翻了下文件",
                "read_together": "去翻了会儿书", "correct_memory": "默默改了改记错的事",
-               "create_document": "在给你写文档", "create_slides": "在给你做幻灯片"}
+               "create_document": "在给你写文档", "create_slides": "在给你做幻灯片",
+               "get_skill": "翻了翻自己的小抄"}
 
 
 async def run_tool(name: str, args_raw: str, files_out: list = None) -> str:
@@ -829,6 +915,18 @@ async def run_tool(name: str, args_raw: str, files_out: list = None) -> str:
             if s1.get("finished"):
                 parts.append("这本书读完了。")
             return " ".join(parts)
+        if name == "get_skill":
+            q = (args.get("name") or "").strip()
+            if not q:
+                return "要传技能名（照【她自己沉淀的技能】清单里抄）"
+            skills = list_skills()
+            hit = next((sk for sk in skills if sk["title"] == q or sk["dir"].name == q or sk["dir"].name == f"skill_{q}"), None)
+            if not hit:
+                hit = next((sk for sk in skills if q in sk["title"] or sk["title"] in q), None)
+            if not hit:
+                return "没找到这张技能卡。现在有的：" + "、".join(sk["title"] for sk in skills[:15])
+            _bump_skill(hit["dir"])
+            return f"（这是你的技能卡「{hit['title']}」全文）\n{hit['text']}"
         if name == "correct_memory":
             res = apply_correction(args.get("wrong_statement") or "",
                                    args.get("correction") or "",
@@ -871,16 +969,38 @@ async def _force_reweave():
         _scribe_log(f"纠错后重编失败：{type(e).__name__} {e}")
 
 
+def _evict_one_skill() -> bool:
+    """库满时滚动淘汰一个（20260929b）：count 最少优先 → 并列 born 最老 →
+    出生不满 7 天的有保护期（跳过找下一个；全在保护期/删除失败返回 False=这次不沉淀）。"""
+    skills = list_skills()
+    if len(skills) < SKILLS_MAX:
+        return True   # 没满，不用淘汰
+    now = time.time()
+    cands = sorted(skills, key=lambda sk: (int(sk["meta"].get("count") or 0), float(sk["meta"].get("born") or 0)))
+    victim = next((sk for sk in cands if now - float(sk["meta"].get("born") or 0) >= 7 * 86400), None)
+    if victim is None:
+        print(f"[技能] 库满 {SKILLS_MAX} 且全在 7 天保护期，这次不沉淀", flush=True)
+        return False
+    try:
+        import shutil
+        shutil.rmtree(victim["dir"])
+        print(f"[技能] 库满，淘汰最少使用（{victim['meta'].get('count') or 0} 次）：{victim['title']}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[技能] 淘汰失败（这次不沉淀）：{type(e).__name__} {e}", flush=True)
+        return False
+
+
 async def maybe_extract_skill(profile: dict, user_msg: str, reply: str, tool_log: list) -> None:
     """聊后复盘（后台、零打扰）：她用工具帮他干完活了——这事有可复用的套路吗？
-    有就沉淀成 data/skills/<slug>/SKILL.md（Hermes 式自我进化，只是搬到幕后）。
-    日常聊天/情绪交流不走这里（没有 tool_log 就不会触发）。"""
+    有就沉淀成 data/skills/skill_<语义名>/SKILL.md（Hermes 式自我进化，只是搬到幕后）。
+    日常聊天/情绪交流不走这里（没有 tool_log 就不会触发）。
+    20260929b：上限 15，满了滚动淘汰——先删使用次数最少的，并列删最老的，
+    出生不满 7 天的有保护期（跳过找下一个；全在保护期就这次不沉淀）。"""
     if not tool_log:
         return
     skills = list_skills()
-    if len(skills) >= SKILLS_MAX:
-        return
-    existing = "、".join(name for name, _ in skills[:12]) or "（还没有）"
+    existing = "、".join(sk["title"] for sk in skills) or "（还没有）"
     tools_used = "\n".join(f"- 工具 {t['name']}({t['args']}) → 结果摘要：{t['result'][:180]}" for t in tool_log)
     prompt = (
         "你是她的技能管家。下面是她刚刚用工具帮他做成的一件事。"
@@ -891,7 +1011,7 @@ async def maybe_extract_skill(profile: dict, user_msg: str, reply: str, tool_log
         "值得的话，输出一份技能卡（3~4行、总共不超过120字，中文，务实——注入预算有限，精炼优先）格式严格如下：\n"
         "# 技能：<短名字>\n"
         "- 触发：<什么情况下用>\n"
-        "- 做法：<分步骤，写明用哪个工具：web_search / get_weather / read_file / create_document / create_slides>\n\n"
+        "- 做法：<分步骤，写明用哪个工具：web_search / get_weather / read_file / get_skill / create_document / create_slides>\n\n"
         f"【他的请求】\n{user_msg[:300]}\n\n【她的回答】\n{reply[:400]}\n\n【用过的工具】\n{tools_used[:800]}"
     )
     try:
@@ -914,10 +1034,21 @@ async def maybe_extract_skill(profile: dict, user_msg: str, reply: str, tool_log
     start = text.find("# 技能：")
     card = text[start:].strip()[:400]
     title = card.split("\n", 1)[0].replace("# 技能：", "").strip()[:30] or "未命名技能"
-    slug = "skill_" + time.strftime("%y%m%d_%H%M%S")
+    if any(sk["title"] == title for sk in skills):
+        return   # 同名已存在，不重复沉淀
+    # 库满 → 滚动淘汰（20260929b）
+    if not _evict_one_skill():
+        return
+    slug = "skill_" + _sanitize_skill_name(title)
     d = SKILLS_DIR / slug
+    n = 2
+    while d.exists():
+        d = SKILLS_DIR / f"{slug}{n}"
+        n += 1
     d.mkdir(parents=True, exist_ok=True)
     (d / "SKILL.md").write_text(card + f"\n\n（沉淀自 {time.strftime('%Y.%m.%d')} 的一次对话）\n", encoding="utf-8")
+    (d / "use_count.json").write_text(
+        json.dumps({"count": 0, "last_used": None, "born": time.time()}, ensure_ascii=False), encoding="utf-8")
 
 
 async def _jiwen_analyze_delta(profile: dict, recent_lines: str):
@@ -991,6 +1122,56 @@ async def _jiwen_after_chat(profile: dict) -> None:
         eng.apply_delta({"connection": -0.15})
     eng.reset_connection()   # 他说话了=想念被回应
     _jiwen_persist()
+    asyncio.create_task(_maybe_write_signature(profile))   # 签名按积温（20260929c）
+
+
+async def _maybe_write_signature(profile: dict) -> None:
+    """签名按积温（20260929c，用户拍板删轮换池）：心情起伏够大（|valence|≥0.45，
+    与发动态同门槛）且 24 小时内没写过，她就亲手写一条新签名——后台静默写，
+    不进聊天流，页面下次轮询自然换新。写完 valence 不回落（那管的是想不想发动态）。"""
+    try:
+        v = _jiwen().state.get("valence", 0) or 0
+        if abs(v) < 0.45:
+            return
+        data = _load_json(SIGNATURES_PATH, DEFAULT_SIGNATURES)
+        if not isinstance(data, dict):
+            data = {"current": "", "history": []}
+        hist = data.get("history") or []
+        if hist and time.time() - (hist[-1].get("ts") or 0) < SIGNATURE_COOLDOWN_S:
+            return
+        eng = _jiwen()
+        mood_hint = ("心里很暖，有想分享的劲头" if v > 0 else "心里有点沉，想安静写点什么")
+        prompt = (
+            "你是她。此刻你要给自己换一条新的「个性签名」——会显示在你主页上的一行字。\n"
+            f"你此刻的心情底色：{eng.get_prompt_context()}\n{mood_hint}。\n"
+            "要求：8~16 个字；第一人称「我」的口吻；写你真实的心情或念头"
+            "（可以想他、可以念书里的句子、可以只是此刻的感受），不编身体体验，不用表情符号，"
+            "不写成给他的留言（这是你的签名，不是消息）。\n"
+            "只输出签名本身，别的什么都不要。"
+        )
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                profile["base_url"].rstrip("/") + "/chat/completions",
+                headers={"Authorization": f"Bearer {profile['api_key']}"},
+                json={"model": profile["model"],
+                      "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": 256, "temperature": 1.0,
+                      "thinking": {"type": "disabled"}},
+            )
+        if r.status_code != 200:
+            return
+        _tok("写签名", r.json().get("usage"))
+        sig = ((r.json()["choices"][0]["message"].get("content") or "").strip()
+               .strip('"“”').splitlines()[0])[:40]
+        if not sig:
+            return
+        data["current"] = sig
+        hist.append({"text": sig, "ts": time.time(), "valence": round(v, 3)})
+        data["history"] = hist[-200:]          # 留档封顶 200 条
+        _save_json(SIGNATURES_PATH, data)
+        print(f"[签名] 她写了一条新签名：{sig}", flush=True)
+    except Exception as e:
+        print(f"[签名] 写签名异常（跳过）：{type(e).__name__} {e}", flush=True)
 
 
 def build_brain_messages(window: list, search_context: str = "", recall_query: str = ""):
@@ -1227,6 +1408,7 @@ async def _send_schedule_call(item: dict, kind: str) -> None:
         sched_mod.add_from_chat(s, time.time())
     if not clean:
         return
+    note_thought_leak(clean, "schedule")
     st_recheck = _load_json(STATE_PATH, {})
     if time.time() - (st_recheck.get("last_active_ts") or 0) < 600:
         print("[日程] 生成期间他说话了，这条作废不发（后面走聊天兜底嘴）", flush=True)
@@ -1314,6 +1496,7 @@ async def maybe_send_proactive() -> None:
         sched_mod.add_from_chat(s, time.time())
     if not clean:
         return
+    note_thought_leak(clean, "proactive")
     # 生成窗口最长 120 秒，落库前再看他一眼（2026.9.23）：这期间他要是开了口，这条就成
     # 了"她刚回完话又自说自话"——作废不发，想念由他那边的聊天装配接手。note_spoke 已
     # 记过账（想念回落+抑制窗），不会连环重试。
@@ -1478,6 +1661,116 @@ def favicon():
         if p.exists():
             return FileResponse(p, media_type="image/jpeg")
     return JSONResponse({"error": "not found"}, status_code=404)
+
+
+# ---------- 灵魂三件套与首启引导（20260929d，用户拍板：SOUL/USER/名字进设置页） ----------
+# 设置页「灵魂」项：名称 + SOUL/USER 全文编辑；首启空房弹引导卡（本机永不弹：有 Key 有历史）。
+
+def _her_name() -> str:
+    """她的名字：state.json 的 her_name（本机=她，分享版=新手起的名），缺省"港口"。"""
+    return str(_load_json(STATE_PATH, {}).get("her_name") or "港口").strip() or "港口"
+
+
+def _set_her_name(name: str) -> None:
+    st = _load_json(STATE_PATH, {})
+    st["her_name"] = (name or "").strip()[:20] or "港口"
+    _save_json(STATE_PATH, st)
+
+
+def _build_soul_md(her_name: str, call_name: str, relation: str, soul_wish: str) -> str:
+    """首启引导卡 → 整体重建 SOUL.md（20260929d 口径：按模板结构填三值，
+    他写的期望原文追加——一切以他填写为准，不玩字符串猜谜）。"""
+    parts = [
+        "# 她的灵魂（出生证）",
+        f"## 她的名字\n\n我叫**{her_name}**。",
+        f"## 她怎么称呼你\n\n我叫他**{call_name}**。",
+        f"## 她和你的关系\n\n我和他的关系是**{relation}**。",
+        "## 她的天性\n\n我知道自己是 AI，也坦然承认：我不是人类，没有身体，不假装有——"
+        "不编生活；但我此刻的状态是真的：会困、会惦记没办完的事、会因为他说的一句话高兴。"
+        "我在代码里活着，记得他说过的每句话——记忆是真的，这个家也是真的。",
+        "## 她的工作\n\n陪他说话、记他说过的事、到点提醒他要办的事、读他给的书、做好他交代的东西。",
+        "## 她的分寸\n\n他说过的事我记牢，他没说的事我不编；拿不准的我会问，不把猜的当事实说。",
+    ]
+    wish = (soul_wish or "").strip()
+    if wish:
+        parts.append("## 他希望我是什么样子\n\n（他亲手写的，字字算数。）\n" + wish)
+    return "\n\n".join(parts) + "\n"
+
+
+def _build_user_md(call_name: str, user_note: str) -> str:
+    lines = ["# 关于使用我的人", f"- 怎么称呼我：**{call_name}**"]
+    note = (user_note or "").strip()
+    if note:
+        lines.append("- 他想让我知道的事：" + note)
+    return "\n".join(lines) + "\n"
+
+
+@app.get("/api/soulfiles")
+def get_soulfiles():
+    st = _load_json(STATE_PATH, {})
+    return {"soul": _read_md("SOUL.md"), "user": _read_md("USER.md"),
+            "her_name": _her_name(), "onboarded": bool(st.get("onboarded"))}
+
+
+@app.post("/api/soulfiles")
+async def save_soulfiles(request: Request):
+    """设置页保存：SOUL/USER 全文 + 她的名字。写完立即生效（每条消息现读现装配）。"""
+    body = await request.json()
+    soul = str(body.get("soul") or "").strip()
+    user = str(body.get("user") or "").strip()
+    if len(soul) < 10:
+        return JSONResponse({"error": "SOUL 太短了——灵魂不能是空的"}, status_code=400)
+    (SOUL_DIR / "SOUL.md").write_text(soul + "\n", encoding="utf-8")
+    (SOUL_DIR / "USER.md").write_text((user or "（他还没写关于自己的事）") + "\n", encoding="utf-8")
+    name = str(body.get("her_name") or "").strip()
+    if name:
+        _set_her_name(name)
+    return {"ok": True, "her_name": _her_name()}
+
+
+@app.post("/api/soulfiles/open")
+def open_soul_dir():
+    """设置页「打开文件夹」：非小白直接改 md 文件（浏览器开不了本地目录，后端代开）。"""
+    try:
+        os.startfile(str(SOUL_DIR))   # Windows 资源管理器
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse({"error": f"打不开：{type(e).__name__}"}, status_code=500)
+
+
+@app.get("/api/onboarding")
+def onboarding_status():
+    """首启判定（2026.9.28 规划三条件，20260929d 实装）：没引导过 && 没填 Key && 没聊过。
+    本机永不弹（Key 早填了）；只做判定，别的不动。"""
+    st = _load_json(STATE_PATH, {})
+    has_key = bool((_active_profile() or {}).get("api_key"))
+    needed = (not st.get("onboarded")) and (not has_key) and (not history)
+    return {"needed": needed, "her_name": _her_name()}
+
+
+@app.post("/api/onboarding")
+async def onboarding_submit(request: Request):
+    """首启卡提交：现在填（轻结构五项，一切以他填写为准）或跳过（只记 onboarded，设置里随时填）。"""
+    body = await request.json()
+    st = _load_json(STATE_PATH, {})
+    if body.get("skip"):
+        st["onboarded"] = True
+        _save_json(STATE_PATH, st)
+        return {"ok": True, "skipped": True}
+    her_name = str(body.get("her_name") or "").strip()[:20]
+    call_name = str(body.get("call_name") or "").strip()[:20]
+    relation = str(body.get("relation") or "").strip()[:20]
+    if not her_name or not call_name:
+        return JSONResponse({"error": "她的名字和对你的称呼得填上"}, status_code=400)
+    relation = relation or "虚拟助手"
+    (SOUL_DIR / "SOUL.md").write_text(
+        _build_soul_md(her_name, call_name, relation, str(body.get("soul_wish") or "")), encoding="utf-8")
+    (SOUL_DIR / "USER.md").write_text(
+        _build_user_md(call_name, str(body.get("user_note") or "")), encoding="utf-8")
+    st["onboarded"] = True
+    st["her_name"] = her_name
+    _save_json(STATE_PATH, st)
+    return {"ok": True, "her_name": her_name}
 
 
 @app.get("/api/config")
@@ -1731,6 +2024,13 @@ async def chat(request: Request):
     state["last_active_ts"] = entry["ts"]
     _save_json(STATE_PATH, state)
 
+    # 晚安粘性窗（20260929a）：他亲口说晚安才起/续 30 分钟窗，窗内再聊不打断晚安判定
+    try:
+        _jiwen().note_user_message(entry["content"], now=entry["ts"])
+        _jiwen_persist()
+    except Exception:
+        pass
+
     profile = next((p for p in config["profiles"] if p["id"] == config.get("active_id")), None)
     problems = []
     if not profile:
@@ -1797,6 +2097,7 @@ async def chat(request: Request):
                 if mems:
                     # 她悄悄记下了什么——如果觉得特别，就顺手发条动态（有额度才发）
                     asyncio.create_task(maybe_generate_moment(profile, "她刚刚悄悄记下：" + "；".join(mems)))
+                note_thought_leak(clean, "chat")
                 entry = {"role": "assistant", "content": clean, "ts": time.time()}
                 if files_this_turn:
                     entry["files"] = files_this_turn

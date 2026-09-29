@@ -173,13 +173,15 @@ async def set_my_status(request: Request):
 
 @router.get("/api/signatures")
 def get_signatures():
-    """个性签名池：data/signatures.json，可自行增删。"""
-    if not SIGNATURES_PATH.exists():
-        _save_json(SIGNATURES_PATH, DEFAULT_SIGNATURES)
-    sigs = _load_json(SIGNATURES_PATH, DEFAULT_SIGNATURES)
-    if not isinstance(sigs, list) or not sigs:
-        sigs = DEFAULT_SIGNATURES
-    return {"signatures": [str(s) for s in sigs]}
+    """个性签名（20260929c 改制）：她按积温亲手写的，只显示最新一条；旧轮换池已删。
+    读到旧版 list（预设池残留）就地转成空的新结构——页面上不再显示预设句。"""
+    data = _load_json(SIGNATURES_PATH, DEFAULT_SIGNATURES)
+    if not isinstance(data, dict):
+        data = {"current": "", "history": []}
+        _save_json(SIGNATURES_PATH, data)
+    data.setdefault("current", "")
+    data.setdefault("history", [])
+    return {"current": str(data["current"]), "history": data["history"]}
 
 
 @router.get("/api/stats")

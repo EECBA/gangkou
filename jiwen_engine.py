@@ -86,15 +86,24 @@ def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+# 晚安词族（20260929a 粘性窗）：他亲口说的才算——她主动说的晚安是安抚，不是他下线
+GOODNIGHT_WORDS = ("晚安", "睡了", "去睡", "睡觉", "困了", "休息了", "先躺")
+GOODNIGHT_RATE = 0.0003          # 晚安档：他睡了，不急
+GOODNIGHT_STICKY_S = 30 * 60     # 粘性窗：说了晚安起 30 分钟内再聊什么都不打断晚安判定
+
+
+def is_goodnight(text) -> bool:
+    return bool(text) and any(kw in text for kw in GOODNIGHT_WORDS)
+
+
 def connection_rate(last_user_text):
     """connection 基础增长速率（每分钟）。关键词粗分类足够——
     语气和上下文的精度交给聊天后的 LLM delta 分析，这里只需要"睡了/出门/正常聊"三挡。"""
     if not last_user_text:
         return 0.0007
     t = last_user_text
-    for kw in ("晚安", "睡了", "去睡", "睡觉", "困了", "休息了", "先躺"):
-        if kw in t:
-            return 0.0003   # 他睡了，不急
+    if is_goodnight(t):
+        return GOODNIGHT_RATE   # 他睡了，不急
     for kw in ("出门", "上课", "去忙", "忙了", "外出", "先不聊", "走啦"):
         if kw in t:
             return 0.0005   # 离开了，比睡觉急一点
@@ -118,6 +127,7 @@ class JiwenEngine:
             "lastSpokeTs": 0,         # 上次她主动开口的时间（抑制窗用）
             "spokeStreak": 0,         # 连续主动开口次数（他不回→抑制窗翻倍；他回复清零）
             "userStatus": "active",
+            "goodnightTs": None,      # 他上次说晚安的时刻（粘性窗用，20260929a）
         }
         if initial:
             st.update({k: v for k, v in initial.items() if k in st})
@@ -134,6 +144,12 @@ class JiwenEngine:
 
         # connection：基础速率 × 加速度 × 沉浸阻尼（距上次消息 < accelDelay 分钟时线性）
         base = connection_rate(last_user_text)
+        # 晚安粘性窗（20260929a）：说了晚安起 30 分钟内，他再聊什么都按晚安速率——
+        # 不然"晚安→哦对了还有件事→又聊十分钟"会把告别判定冲掉，按突然失联攒想念。
+        # 窗外自然回退：最后一条还是晚安就本来就是慢速；说了别的 connection_rate 自然给日常档。
+        gt = s.get("goodnightTs")
+        if gt and 0 <= now - gt <= GOODNIGHT_STICKY_S:
+            base = GOODNIGHT_RATE
         since_last = None  # 宿主不算这个了：挂在 proactive_loop 上每分钟 tick，accel 交给阈值前的自然曲线
         accel = math.pow(1.0 + s["connection"], r["connectionAccel"]) if s["connection"] > 0 else 1.0
         immersion_factor = max(0.0, 1.0 - s["immersion"] * r["immersionDampenConnection"])
@@ -252,6 +268,12 @@ class JiwenEngine:
         """他回复了——想念被真正满足。只在他说活时调，不是她开口后。"""
         self.state["connection"] = AXES["connection"][0]
         self.state["spokeStreak"] = 0   # 他回了，连发抑制解除
+
+    def note_user_message(self, text, now=None):
+        """他发了一条消息（宿主在消息落库时调）。只有他亲口说晚安才起/续粘性窗；
+        别的消息不清窗——窗内说什么都不打断（20260929a 拍板）。"""
+        if is_goodnight(text):
+            self.state["goodnightTs"] = now if now is not None else time.time()
 
     def note_spoke(self, now=None):
         """她主动开口了：说完就缓解（直接压到考虑线以下，防连环触发），
@@ -437,7 +459,31 @@ def _selftest():
     check("catchup week saturates and 30d capped as 7d",
           ec3.state["connection"] > 0.9 and ec4.state["connection"] > 0.9
           and abs(ec3.state["connection"] - ec4.state["connection"]) < 1e-9)
-    print(f"\n{ok[0]} checks passed (16 groups, incl. 3 catch-up cases)")
+
+    # 17. 晚安粘性窗（20260929a）：说晚安后 20 分钟内他又发日常消息——速率仍按晚安档
+    eg = JiwenEngine({"connection": 0.0, "pride": 0.2})
+    eg.note_user_message("晚安，我先去睡了", now=noon)
+    eg.tick(20, now=noon + 20 * 60, last_user_text="对了明天记得带伞，别淋着")
+    en2 = JiwenEngine({"connection": 0.0, "pride": 0.2})
+    en2.tick(20, now=noon + 20 * 60, last_user_text="对了明天记得带伞，别淋着")
+    check("goodnight sticky window keeps slow rate", eg.state["connection"] < en2.state["connection"])
+
+    # 18. 粘性窗外恢复日常：晚安 40 分钟后他再说日常话——轨迹应与"从没说过晚安"完全一致
+    eg2 = JiwenEngine({"connection": 0.0, "pride": 0.2})
+    eg2.note_user_message("晚安", now=noon)
+    eg2.tick(40, now=noon + 40 * 60, last_user_text="早上好呀，我起来了")
+    ec0 = JiwenEngine({"connection": 0.0, "pride": 0.2})
+    ec0.tick(40, now=noon + 40 * 60, last_user_text="早上好呀，我起来了")
+    check("after sticky window normal rate resumes",
+          abs(eg2.state["connection"] - ec0.state["connection"]) < 1e-9)
+
+    # 19. 窗外没说话：最后一条还是晚安——晚安档一直生效（含 note 不清窗的回归）
+    eg3 = JiwenEngine({"connection": 0.0, "pride": 0.2})
+    eg3.note_user_message("晚安", now=noon)
+    eg3.tick(40, now=noon + 40 * 60, last_user_text="晚安")
+    check("goodnight holds while he stays silent",
+          eg3.state["connection"] < en2.state["connection"])
+    print(f"\n{ok[0]} checks passed (19 groups, incl. 3 catch-up + 3 goodnight-sticky cases)")
 
 
 if __name__ == "__main__":
